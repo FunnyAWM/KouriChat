@@ -1,0 +1,9 @@
+# Linux版微信登录点击器依赖
+pyautogui>=0.9.54
+psutil>=5.8.0
+python-xlib>=0.29
+
+# 系统依赖（需要手动安装）:
+# Ubuntu/Debian: sudo apt-get install wmctrl x11-utils python3-tk
+# Fedora/RHEL: sudo dnf install wmctrl xorg-x11-utils tkinter
+# Arch Linux: sudo pacman -S wmctrl xorg-xwininfo tk
