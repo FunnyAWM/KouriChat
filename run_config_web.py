@@ -37,6 +37,7 @@ from datetime import timedelta
 from src.utils.console import print_status
 from src.avatar_manager import avatar_manager  # 导入角色设定管理器
 from src.webui.routes.avatar import avatar_bp
+import platform
 import ctypes
 import win32api
 import win32con
@@ -2348,8 +2349,12 @@ def get_announcement():
 @app.route('/reconnect_wechat')
 def reconnect_wechat():
     try:
+        if platform.system() == 'Windows':
+            from src.Wechat_Login_Clicker.Wechat_Login_Clicker import click_wechat_buttons
+        elif platform.system() == 'Linux':
+            from src.Wechat_Login_Clicker.Wechat_Login_Clicker_Linux import click_wechat_buttons
         # 导入微信登录点击器
-        from src.Wechat_Login_Clicker.Wechat_Login_Clicker import click_wechat_buttons
+
 
         # 执行点击操作
         result = click_wechat_buttons()
