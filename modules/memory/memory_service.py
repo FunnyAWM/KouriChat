@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import glob
 from typing import List, Dict, Optional
 from datetime import datetime
 from src.services.ai.llm_service import LLMService
@@ -25,6 +26,14 @@ class MemoryService:
         self.max_groups = max_groups  # 保存上下文组数设置
         self.llm_client = None
         self.conversation_count = {}  # 记录每个角色与用户组合的对话计数: {avatar_name_user_id: count}
+        self.deepseek = LLMService(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            max_token=max_token,
+            temperature=temperature,
+            max_groups=max_groups
+        )
 
     def initialize_memory_files(self, avatar_name: str, user_id: str):
         """初始化角色的记忆文件，确保文件存在"""
@@ -82,6 +91,13 @@ class MemoryService:
         """获取核心记忆文件路径"""
         memory_dir = self._get_avatar_memory_dir(avatar_name, user_id)
         return os.path.join(memory_dir, "core_memory.json")
+    
+    def _get_core_memory_backup_path(self, avatar_name: str, user_id: str) -> str:
+        """获取核心记忆备份文件路径"""
+        memory_dir = self._get_avatar_memory_dir(avatar_name, user_id)
+        backup_dir = os.path.join(memory_dir, "backup")
+        os.makedirs(backup_dir, exist_ok=True)
+        return os.path.join(backup_dir, "core_memory_backup.json")
     
     def add_conversation(self, avatar_name: str, user_message: str, bot_reply: str, user_id: str, is_system_message: bool = False):
         """
@@ -147,124 +163,157 @@ class MemoryService:
             # 每10轮对话更新一次核心记忆
             if self.conversation_count[conversation_key] >= 10:
                 logger.info(f"角色 {avatar_name} 为用户 {user_id} 达到10轮对话，开始更新核心记忆")
-                self.update_core_memory(avatar_name, user_id)
+                context = self.get_recent_context(avatar_name, user_id)
+                self.update_core_memory(avatar_name, user_id, context)
                 self.conversation_count[conversation_key] = 0
                 
         except Exception as e:
             logger.error(f"添加对话到短期记忆失败: {str(e)}")
     
-    def update_core_memory(self, avatar_name: str, user_id: str):
+    def _build_memory_prompt(self, filepath: str) -> str:
         """
-        更新核心记忆，将短期记忆和现有核心记忆整合，生成新的核心记忆摘要
+        从指定目录读取 md 文件。
+
+        Args:
+            filepath: md 文件的路径。
+
+        Returns:
+            一个包含 md 文件内容的字符串。
         """
         try:
-            short_memory_path = self._get_short_memory_path(avatar_name, user_id)
+            with open(filepath, 'r', encoding='utf-8') as f:
+                return f.read()
+        except FileNotFoundError:
+            logger.error(f"核心记忆提示词模板 {filepath} 未找到。")
+            return ""
+        except Exception as e:
+            logger.error(f"读取核心提示词模板 {filepath} 时出错: {e}")
+            return ""
+
+    def _generate_core_memory(self, prompt: str, existing_core_memory: str, context: list, user_id: str) -> str:
+        response = self.deepseek.get_response(
+            message=f"请根据设定和要求，生成新的核心记忆。现有的核心记忆为：{existing_core_memory}",
+            user_id=user_id,
+            system_prompt=prompt,
+            core_memory=existing_core_memory,
+            previous_context=context
+        )
+
+        
+        return response
+
+    def update_core_memory(self, avatar_name: str, user_id: str, context: list) -> bool:
+        """
+        更新角色的核心记忆
+        
+        Args:
+            avatar_name: 角色名称
+            user_id: 用户ID
+            message: 用户消息
+            response: 机器人响应
+        
+        Returns:
+            bool: 是否成功更新
+        """
+        try:
+            # 获取核心记忆文件路径
             core_memory_path = self._get_core_memory_path(avatar_name, user_id)
             
-            # 读取短期记忆
-            short_memory = []
-            if os.path.exists(short_memory_path):
-                with open(short_memory_path, "r", encoding="utf-8") as f:
-                    short_memory = json.load(f)
-            
-            if not short_memory:
-                logger.info(f"短期记忆为空，跳过核心记忆更新: {avatar_name} 用户: {user_id}")
-                return
-            
             # 读取现有核心记忆
-            core_memory = ""
+            existing_core_memory = ""
+            existing_core_data = []
+            
             if os.path.exists(core_memory_path):
                 try:
                     with open(core_memory_path, "r", encoding="utf-8") as f:
                         core_data = json.load(f)
-                        core_memory = core_data.get("content", "")
-                except (json.JSONDecodeError, KeyError):
-                    logger.warning(f"核心记忆文件损坏或格式错误，将重新生成: {core_memory_path}")
+                        # 处理数组格式（旧格式）
+                        if isinstance(core_data, list) and len(core_data) > 0:
+                            existing_core_memory = core_data[0].get("content", "")
+                        else:
+                            # 新格式（单个对象）
+                            existing_core_memory = core_data.get("content", "")
+                        existing_core_data = core_data
+                except Exception as e:
+                    logger.error(f"读取核心记忆失败: {str(e)}")
+                    # 创建空的核心记忆
+                    existing_core_memory = ""
+                    existing_core_data = None
             
-            # 构建最近对话内容（适配新的记忆格式）
-            recent_conversations = "\n".join([
-                f"用户: {conv.get('user', {}).get('content', '') if isinstance(conv.get('user'), dict) else conv.get('user', '')}\n"
-                f"回复: {conv.get('bot', {}).get('content', '') if isinstance(conv.get('bot'), dict) else conv.get('bot', '')}" 
-                for conv in short_memory[-10:]  # 仅使用最近10轮对话
-            ])
+            # 如果没有现有记忆，创建一个空的对象（新格式）
+            if not existing_core_data:
+                existing_core_data = {
+                    "timestamp": self._get_timestamp(),
+                    "content": ""
+                }
             
-            # 读取外部提示词文件
-            try:
-                # 从当前文件位置获取项目根目录
-                current_dir = os.path.dirname(os.path.abspath(__file__))
-                project_root = os.path.dirname(os.path.dirname(current_dir))
-                prompt_path = os.path.join(project_root, "data", "base", "memory.md")
-                
-                if not os.path.exists(prompt_path):
-                    logger.error(f"核心记忆提示词文件不存在: {prompt_path}")
-                    logger.info(f"跳过核心记忆更新: {avatar_name} 用户: {user_id}")
-                    return
-                    
-                with open(prompt_path, "r", encoding="utf-8") as f:
-                    memory_prompt_template = f.read().strip()
-                    logger.debug(f"已加载记忆提示词模板，长度: {len(memory_prompt_template)} 字节")
-            except Exception as e:
-                logger.error(f"读取记忆提示词模板失败: {str(e)}")
-                logger.info(f"跳过核心记忆更新: {avatar_name} 用户: {user_id}")
-                return
-            
-            # 构建完整提示词
-            prompt = f"""{memory_prompt_template}
+            # 构建提示词
+            prompt = self._build_memory_prompt('src/base/memory.md')
 
-现有核心记忆：
-{core_memory}
-
-最近对话内容：
-{recent_conversations}"""
-            
             # 调用LLM生成新的核心记忆
-            llm = self._get_llm_client()
-            client_id = f"core_memory_{avatar_name}_{user_id}"
-            new_core_memory = llm.get_response(
-                message=prompt,
-                user_id=client_id,
-                system_prompt="你是一个专注于信息提炼的AI助手。你的任务是从对话中提取最关键的信息，并创建一个极其精简的摘要。"
-            )
+            new_core_memory = self._generate_core_memory(prompt, existing_core_memory, context, user_id)
             
-            # 检查是否为错误响应，如果是则保留原有核心记忆
-            if new_core_memory.startswith("Error:"):
-                logger.warning(f"生成核心记忆时出现错误，保留原有核心记忆: {new_core_memory}")
-                new_core_memory = core_memory
-            
-            # 保存新的核心记忆
-            core_data = {
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            # 如果生成失败，保留原有记忆
+            if not new_core_memory or 'Error' in new_core_memory or 'error' in new_core_memory or '错误' in new_core_memory:
+                logger.warning("生成核心记忆失败，保留原有记忆")
+                return False
+                
+            # 更新核心记忆文件（使用新格式：单个对象）
+            updated_core_data = {
+                "timestamp": self._get_timestamp(),
                 "content": new_core_memory
             }
             
             with open(core_memory_path, "w", encoding="utf-8") as f:
-                json.dump(core_data, f, ensure_ascii=False, indent=2)
-            
-            logger.info(f"已更新角色 {avatar_name} 为用户 {user_id} 的核心记忆")
+                json.dump(updated_core_data, f, ensure_ascii=False, indent=2)
+                
+            logger.info(f"已更新角色 {avatar_name} 用户 {user_id} 的核心记忆")
+            return True
             
         except Exception as e:
             logger.error(f"更新核心记忆失败: {str(e)}")
-    
+            
+            # 如果在处理过程中发生错误，确保不会丢失现有记忆
+            try:
+                if os.path.exists(core_memory_path) and existing_core_data:
+                    with open(core_memory_path, "w", encoding="utf-8") as f:
+                        json.dump(existing_core_data, f, ensure_ascii=False, indent=2)
+            except Exception as recovery_error:
+                logger.error(f"恢复核心记忆失败: {str(recovery_error)}")
+                
+            return False
+
     def get_core_memory(self, avatar_name: str, user_id: str) -> str:
-        """获取角色的核心记忆内容"""
+        """
+        获取角色的核心记忆
+        
+        Args:
+            avatar_name: 角色名称
+            user_id: 用户ID
+        
+        Returns:
+            str: 核心记忆内容
+        """
         try:
+            # 获取核心记忆文件路径
             core_memory_path = self._get_core_memory_path(avatar_name, user_id)
             
+            # 如果文件不存在，返回空字符串
             if not os.path.exists(core_memory_path):
-                logger.info(f"核心记忆不存在: {avatar_name} 用户: {user_id}")
                 return ""
             
-            logger.debug(f"获取用户核心记忆: 角色={avatar_name}, 用户ID={user_id}")
-            logger.debug(f"核心记忆路径: {core_memory_path}")
-            
+            # 读取核心记忆文件
             with open(core_memory_path, "r", encoding="utf-8") as f:
                 core_data = json.load(f)
-                core_memory = core_data.get("content", "")
-                logger.debug(f"核心记忆长度: {len(core_memory)} 字节")
-                return core_memory
                 
+                # 处理数组格式
+                if isinstance(core_data, list) and len(core_data) > 0:
+                    return core_data[0].get("content", "")
+                else:
+                    # 兼容旧格式
+                    return core_data.get("content", "")
         except Exception as e:
-            logger.info(f"获取核心记忆失败: {str(e)}")
+            logger.error(f"获取核心记忆失败: {str(e)}")
             return ""
     
     def get_recent_context(self, avatar_name: str, user_id: str, context_size: int = None) -> List[Dict]:
@@ -307,4 +356,48 @@ class MemoryService:
 
     def _get_timestamp(self) -> str:
         """获取当前时间戳"""
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S") 
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    def has_user_memory(self, avatar_name: str, user_id: str) -> bool:
+        """
+        检查是否存在该用户的私聊记忆
+        
+        Args:
+            avatar_name: 角色名称
+            user_id: 用户ID
+            
+        Returns:
+            bool: 如果存在私聊记忆返回True，否则返回False
+        """
+        try:
+            # 检查短期记忆是否存在且非空
+            short_memory_path = self._get_short_memory_path(avatar_name, user_id)
+            if os.path.exists(short_memory_path):
+                with open(short_memory_path, "r", encoding="utf-8") as f:
+                    short_memory = json.load(f)
+                    if short_memory:  # 如果列表不为空
+                        logger.debug(f"用户 {user_id} 与角色 {avatar_name} 有私聊记忆，条数: {len(short_memory)}")
+                        return True
+            
+            # 检查核心记忆是否存在且非空
+            core_memory_path = self._get_core_memory_path(avatar_name, user_id)
+            if os.path.exists(core_memory_path):
+                with open(core_memory_path, "r", encoding="utf-8") as f:
+                    core_memory = json.load(f)
+                    # 处理数组格式（旧格式）
+                    if isinstance(core_memory, list) and len(core_memory) > 0:
+                        if core_memory[0].get("content", "").strip():  # 如果内容不为空
+                            logger.debug(f"用户 {user_id} 与角色 {avatar_name} 有核心记忆")
+                            return True
+                    else:
+                        # 新格式（单个对象）
+                        if core_memory.get("content", "").strip():  # 如果内容不为空
+                            logger.debug(f"用户 {user_id} 与角色 {avatar_name} 有核心记忆")
+                            return True
+            
+            logger.debug(f"用户 {user_id} 与角色 {avatar_name} 没有私聊记忆")
+            return False
+            
+        except Exception as e:
+            logger.error(f"检查用户记忆失败: {str(e)}")
+            return False 

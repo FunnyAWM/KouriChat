@@ -25,6 +25,9 @@ from tenacity import (
     retry_if_exception_type
 )
 
+# 导入emoji库用于处理表情符号
+import emoji
+
 # 修改logger获取方式，确保与main模块一致
 logger = logging.getLogger('main')
 
@@ -98,13 +101,30 @@ class LLMService:
         1. 移除控制字符
         2. 标准化换行符
         3. 防止字符串截断异常
+        4. 处理emoji表情符号，确保跨平台兼容性
         """
         try:
+            # 移除控制字符
             cleaned = re.sub(self.safe_pattern, '', raw_text)
-            return cleaned.replace('\r\n', '\n').replace('\r', '\n')
+
+            # 标准化换行符
+            cleaned = cleaned.replace('\r\n', '\n').replace('\r', '\n')
+
+            # 处理emoji表情符号
+            cleaned = self._process_emojis(cleaned)
+
+            return cleaned
         except Exception as e:
             logger.error(f"Response sanitization failed: {str(e)}")
             return "响应处理异常，请重新尝试"
+
+    def _process_emojis(self, text: str) -> str:
+        """处理文本中的emoji表情符号，确保跨平台兼容性"""
+        try:
+            # 先将Unicode表情符号转换为别名再转回，确保标准化
+            return emoji.emojize(emoji.demojize(text))
+        except Exception:
+            return text  # 如果处理失败，返回原始文本
 
     def _filter_thinking_content(self, content: str) -> str:
         """
@@ -142,7 +162,7 @@ class LLMService:
         try:
             # 调试：打印完整响应结构
             logger.debug(f"API响应结构: {json.dumps(response, default=str, indent=2)}")
-            
+
             # 尝试获取回复内容
             if isinstance(response, dict):
                 choices = response.get("choices", [])
@@ -183,84 +203,93 @@ class LLMService:
             previous_context: 历史上下文（可选）
             core_memory: 核心记忆（可选）
         """
-            # —— 阶段1：输入验证 ——
-            if not message.strip():
-                return "Error: Empty message received"
+        # —— 阶段1：输入验证 ——
+        if not message.strip():
+            return "Error: Empty message received"
 
-            # —— 阶段2：上下文更新 ——
-            # 只在程序刚启动时（上下文为空时）加载外部历史上下文
-            if previous_context and user_id not in self.chat_contexts:
-                logger.info(f"程序启动初始化：为用户 {user_id} 加载历史上下文，共 {len(previous_context)} 条消息")
-                # 确保上下文只包含当前用户的历史信息
-                self.chat_contexts[user_id] = previous_context.copy()
+        # —— 阶段2：上下文更新 ——
+        # 只在程序刚启动时（上下文为空时）加载外部历史上下文
+        if previous_context and user_id not in self.chat_contexts:
+            logger.info(f"程序启动初始化：为用户 {user_id} 加载历史上下文，共 {len(previous_context)} 条消息")
+            # 确保上下文只包含当前用户的历史信息
+            self.chat_contexts[user_id] = previous_context.copy()
 
-            # 添加当前消息到上下文
-            self._manage_context(user_id, message)
+        # 添加当前消息到上下文
+        self._manage_context(user_id, message)
 
-            # —— 阶段3：构建请求参数 ——
-            # 读取基础Prompt
-            try:
-                # 从当前文件位置(llm_service.py)向上导航到项目根目录
-                current_dir = os.path.dirname(os.path.abspath(__file__))  # src/services/ai
-                project_root = os.path.dirname(os.path.dirname(os.path.dirname(current_dir)))  # 项目根目录
-                base_prompt_path = os.path.join(project_root, "data", "base", "base.md")
+        # —— 阶段3：构建请求参数 ——
+        # 读取基础Prompt
+        try:
+            # 从当前文件位置(llm_service.py)向上导航到项目根目录
+            current_dir = os.path.dirname(os.path.abspath(__file__))  # src/services/ai
+            project_root = os.path.dirname(os.path.dirname(os.path.dirname(current_dir)))  # 项目根目录
+            base_prompt_path = os.path.join(project_root, "src", "base", "base.md")
 
-                with open(base_prompt_path, "r", encoding="utf-8") as f:
-                    base_content = f.read()
-            except Exception as e:
-                logger.error(f"基础Prompt文件读取失败: {str(e)}")
-                base_content = ""
+            with open(base_prompt_path, "r", encoding="utf-8") as f:
+                base_content = f.read()
+        except Exception as e:
+            logger.error(f"基础Prompt文件读取失败: {str(e)}")
+            base_content = ""
 
-            # 构建完整提示词: base + 核心记忆 + 人设
-            if core_memory:
-                final_prompt = f"{base_content}\n\n{core_memory}\n\n{system_prompt}"
-                logger.debug("提示词顺序：base.md + 核心记忆 + 人设")
-            else:
-                final_prompt = f"{base_content}\n\n{system_prompt}"
-                logger.debug("提示词顺序：base.md + 人设")
+        try:
+            project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))  # 项目根目录
+            worldview_path = os.path.join(project_root, "src", "base", "worldview.md")
+            with open(worldview_path, "r", encoding="utf-8") as f:
+                worldview_content = f.read()
+        except FileNotFoundError as e:
+            logger.error(f"世界观文件缺失: {str(e)}")
+        except Exception as e:
+            logger.error(f"加载世界观时出现异常: {str(e)}")
+            worldview_content = ""
 
-            # 构建消息列表
-            messages = [
-                {"role": "system", "content": final_prompt},
-                *self.chat_contexts.get(user_id, [])[-self.config["max_groups"] * 2:]
-            ]
+        # 构建系统提示词: base + 世界观 + 核心记忆 + 人设
+        if not worldview_content and not core_memory:
+            final_prompt = f"{base_content}\n\n你所扮演的角色介绍如下：\n{system_prompt}"
+        elif worldview_content and not core_memory:
+            final_prompt = f"{base_content}\n\n你所饰演的角色所处世界的世界观为：\n{worldview_content}\n\n你所扮演的角色介绍如下：\n{system_prompt}"
+        elif not worldview_content and core_memory:
+            final_prompt = f"{base_content}\n\n你所饰演角色所具备的核心记忆为：\n{core_memory}\n\n你所扮演的角色介绍如下：\n{system_prompt}"
+        else: final_prompt = f"{base_content}\n\n你所饰演的角色所处世界的世界观为：\n{worldview_content}你所饰演角色所具备的核心记忆为：\n{core_memory}\n\n你所扮演的角色介绍如下：\n{system_prompt}"
 
-            # 为 Ollama 构建消息内容
-            chat_history = self.chat_contexts.get(user_id, [])[-self.config["max_groups"] * 2:]
-            history_text = "\n".join([
-                f"{msg['role']}: {msg['content']}"
-                for msg in chat_history
-            ])
-            ollama_message = {
-                "role": "user",
-                "content": f"{final_prompt}\n\n对话历史：\n{history_text}\n\n用户问题：{message}"
-            }
+        # 构建消息列表
+        messages = [
+            {"role": "system", "content": final_prompt},
+            *self.chat_contexts.get(user_id, [])[-self.config["max_groups"] * 2:]
+        ]
 
-            # 检查是否是 Ollama API
-            is_ollama = 'localhost:11434' in str(self.client.base_url)
-        
+        # 为 Ollama 构建消息内容
+        chat_history = self.chat_contexts.get(user_id, [])[-self.config["max_groups"] * 2:]
+        history_text = "\n".join([
+            f"{msg['role']}: {msg['content']}"
+            for msg in chat_history
+        ])
+        ollama_message = {
+            "role": "user",
+            "content": f"{final_prompt}\n\n对话历史：\n{history_text}\n\n用户问题：{message}"
+        }
+
+        # 检查是否是 Ollama API
+        is_ollama = 'localhost:11434' in str(self.client.base_url)
+
         # —— 阶段4：执行API请求（带重试机制）——
         max_retries = 3
         last_error = None
-        
+
         for attempt in range(max_retries):
             try:
-                filtered_content = ""
-
-            if is_ollama:
-                # Ollama API 格式
-                request_config = {
-                    "model": self.config["model"].split('/')[-1],  # 移除路径前缀
-                    "messages": [ollama_message],  # 将消息包装在列表中
-                    "stream": False,
-                    "options": {
-                        "temperature": self.config["temperature"],
-                        "max_tokens": self.config["max_token"]
+                if is_ollama:
+                    # Ollama API 格式
+                    request_config = {
+                        "model": self.config["model"].split('/')[-1],  # 移除路径前缀
+                        "messages": [ollama_message],  # 将消息包装在列表中
+                        "stream": False,
+                        "options": {
+                            "temperature": self.config["temperature"],
+                            "max_tokens": self.config["max_token"]
+                        }
                     }
-                }
 
-                # 使用 requests 库向 Ollama API 发送 POST 请求
-                try:
+                    # 使用 requests 库向 Ollama API 发送 POST 请求
                     # 创建 Updater 实例获取版本信息
                     updater = Updater()
                     version = updater.get_current_version()
@@ -290,57 +319,47 @@ class LLMService:
                     else:
                         raise ValueError(f"错误的API响应结构: {json.dumps(response_data, default=str)}")
 
-                    clean_content = self._sanitize_response(raw_content)
-                    # 过滤思考内容
-                    filtered_content = self._filter_thinking_content(clean_content)
-
-            else:
-                # 标准 OpenAI 格式
-                request_config = {
-                    "model": self.config["model"],  # 模型名称
-                    "messages": messages,  # 消息列表
-                    "temperature": self.config["temperature"],  # 温度参数
-                    "max_tokens": self.config["max_token"],  # 最大 token 数
-                        "top_p": 0.95,  # top_p 参数
+                else:
+                    # 标准 OpenAI 格式
+                    request_config = {
+                        "model": self.config["model"],  # 模型名称
+                        "messages": messages,  # 消息列表
+                        "temperature": self.config["temperature"],  # 温度参数
+                        "max_tokens": self.config["max_token"],  # 最大 token 数
                         "frequency_penalty": 0.2  # 频率惩罚参数
-                }
+                    }
 
-                # 使用 OpenAI 客户端发送请求
-                response = self.client.chat.completions.create(**request_config)
-                    
-                # 验证 API 响应结构
-                if not self._validate_response(response.model_dump()):
+                    # 使用 OpenAI 客户端发送请求
+                    response = self.client.chat.completions.create(**request_config)
+
+                    # 验证 API 响应结构
+                    if not self._validate_response(response.model_dump()):
                         raise ValueError(f"错误的API响应结构: {json.dumps(response.model_dump(), default=str)}")
 
-                # 获取原始内容
-                raw_content = response.choices[0].message.content
+                    # 获取原始内容
+                    raw_content = response.choices[0].message.content
+
                 # 清理响应内容
                 clean_content = self._sanitize_response(raw_content)
                 # 过滤思考内容
                 filtered_content = self._filter_thinking_content(clean_content)
-                
-                # 统一处理错误响应内容（以 "Error" 开头）
+
+                # 检查响应内容是否为错误消息
                 if filtered_content.strip().lower().startswith("error"):
-                    error_msg = filtered_content
-                    logger.warning(f"检测到错误响应 (尝试 {attempt+1}/{max_retries}): {error_msg}")
-                    last_error = f"错误响应: {error_msg}"
-                    
-                    # 如果这不是最后一次尝试，则继续下一次
-                    if attempt < max_retries - 1:
-                        continue
-                
+                    raise ValueError(f"错误响应: {filtered_content}")
+
                 # 成功获取有效响应，更新上下文并返回
                 self._manage_context(user_id, filtered_content, "assistant")
                 return filtered_content or ""
 
-        except Exception as e:
+            except Exception as e:
                 last_error = f"Error: {str(e)}"
                 logger.warning(f"API请求失败 (尝试 {attempt+1}/{max_retries}): {str(e)}")
-                
-                # 如果这不是最后一次尝试，则继续下一次
+
+                # 如果这不是最后一次尝试，则继续
                 if attempt < max_retries - 1:
                     continue
-        
+
         # 所有重试都失败后，记录最终错误并返回
         logger.error(f"所有重试尝试均失败: {last_error}")
         return last_error
@@ -373,14 +392,18 @@ class LLMService:
 
         Args:
             messages: 消息列表，每个消息是包含 role 和 content 的字典
-            **kwargs: 额外的参数配置
+            **kwargs: 额外的参数配置，包括 model、temperature 等
 
         Returns:
             str: AI的回复内容
         """
         try:
+            # 使用传入的model参数，如果没有则使用默认模型
+            model = kwargs.get('model', self.config["model"])
+            logger.info(f"使用模型: {model} 发送聊天请求")
+
             response = self.client.chat.completions.create(
-                model=self.config["model"],
+                model=model,
                 messages=messages,
                 temperature=kwargs.get('temperature', self.config["temperature"]),
                 max_tokens=self.config["max_token"]
@@ -427,7 +450,7 @@ class LLMService:
         """
         获取当前LLM服务的配置参数
         方便外部服务（如记忆服务）获取最新配置
-        
+
         Returns:
             Dict: 包含当前配置的字典
         """
